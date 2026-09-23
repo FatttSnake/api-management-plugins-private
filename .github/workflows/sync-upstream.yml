@@ -1,0 +1,594 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: FatttSnake/api-management-plugins
+  UPSTREAM_BRANCH: master
+  TARGET_BRANCH: master
+  SYNC_BRANCH: sync/upstream-master
+
+jobs:
+  sync:
+    name: Sync upstream repository
+    runs-on: ubuntu-latest
+
+    steps:
+      # ============================================================
+      # 1. Checkout mirror/master
+      # ============================================================
+      - name: Checkout target repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      # ============================================================
+      # 2. Configure Git
+      #
+      # 注意：
+      # 这里只配置 Git 的 author / committer identity。
+      #
+      # 不会因为 git config 而创建 commit。
+      #
+      # 本 workflow 也不会执行 git commit。
+      # ============================================================
+      - name: Configure Git
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Configuring Git"
+          echo "========================================"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "Git user.name  = $(git config user.name)"
+          echo "Git user.email = $(git config user.email)"
+
+          echo
+          echo "Git configuration completed."
+
+      # ============================================================
+      # 3. Configure upstream remote
+      # ============================================================
+      - name: Configure upstream remote
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Configuring upstream remote"
+          echo "========================================"
+
+          UPSTREAM_URL="https://github.com/${UPSTREAM_REPOSITORY}.git"
+
+          echo "Upstream repository : ${UPSTREAM_REPOSITORY}"
+          echo "Upstream URL        : ${UPSTREAM_URL}"
+          echo "Upstream branch     : ${UPSTREAM_BRANCH}"
+          echo "Target branch       : ${TARGET_BRANCH}"
+          echo "Sync branch         : ${SYNC_BRANCH}"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            echo
+            echo "Remote 'upstream' already exists."
+            echo "Updating upstream remote URL..."
+
+            git remote set-url upstream "${UPSTREAM_URL}"
+          else
+            echo
+            echo "Remote 'upstream' does not exist."
+            echo "Adding upstream remote..."
+
+            git remote add upstream "${UPSTREAM_URL}"
+          fi
+
+          echo
+          echo "Configured remotes:"
+          git remote -v
+
+      # ============================================================
+      # 4. Fetch upstream
+      # ============================================================
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Fetching upstream"
+          echo "========================================"
+
+          echo "Fetching:"
+          echo "  repository = ${UPSTREAM_REPOSITORY}"
+          echo "  branch     = ${UPSTREAM_BRANCH}"
+
+          git fetch \
+            --prune \
+            --tags \
+            upstream \
+            "${UPSTREAM_BRANCH}"
+
+          echo
+          echo "Fetch completed successfully."
+
+          echo
+          echo "Upstream reference:"
+          git show-ref "refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+      # ============================================================
+      # 5. Inspect current state
+      # ============================================================
+      - name: Inspect repository state
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Inspecting repository state"
+          echo "========================================"
+
+          TARGET_SHA="$(git rev-parse "${TARGET_BRANCH}")"
+          UPSTREAM_SHA="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+
+          TARGET_SHORT_SHA="$(git rev-parse --short "${TARGET_BRANCH}")"
+          UPSTREAM_SHORT_SHA="$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
+
+          echo "Target branch:"
+          echo "  ${TARGET_BRANCH}"
+          echo "  SHA: ${TARGET_SHA}"
+          echo "  Short SHA: ${TARGET_SHORT_SHA}"
+
+          echo
+          echo "Upstream branch:"
+          echo "  upstream/${UPSTREAM_BRANCH}"
+          echo "  SHA: ${UPSTREAM_SHA}"
+          echo "  Short SHA: ${UPSTREAM_SHORT_SHA}"
+
+          echo
+          echo "Target commit:"
+          git log -1 \
+            --format='  %H%n  Author:    %an <%ae>%n  Committer: %cn <%ce>%n  Date:      %aI%n  Subject:   %s' \
+            "${TARGET_BRANCH}"
+
+          echo
+          echo "Upstream commit:"
+          git log -1 \
+            --format='  %H%n  Author:    %an <%ae>%n  Committer: %cn <%ce>%n  Date:      %aI%n  Subject:   %s' \
+            "upstream/${UPSTREAM_BRANCH}"
+
+          echo
+          echo "Comparing histories..."
+
+          if git merge-base --is-ancestor \
+              "${UPSTREAM_SHA}" \
+              "${TARGET_SHA}"; then
+
+            echo "Result: upstream is already contained in target."
+            echo "No synchronization is required."
+
+            REQUIRED="false"
+
+          else
+
+            echo "Result: upstream contains commits not present in target."
+            echo "Synchronization is required."
+
+            REQUIRED="true"
+
+          fi
+
+          echo
+          echo "Sync required: ${REQUIRED}"
+
+          {
+            echo "target_sha=${TARGET_SHA}"
+            echo "upstream_sha=${UPSTREAM_SHA}"
+            echo "target_short_sha=${TARGET_SHORT_SHA}"
+            echo "upstream_short_sha=${UPSTREAM_SHORT_SHA}"
+            echo "required=${REQUIRED}"
+          } >> "${GITHUB_OUTPUT}"
+
+      # ============================================================
+      # 6. Show incoming commits
+      #
+      # 仅用于日志。
+      # 不修改任何 Git 历史。
+      # ============================================================
+      - name: Show incoming commits
+        if: steps.inspect.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Incoming upstream commits"
+          echo "========================================"
+
+          TARGET_SHA="${{ steps.inspect.outputs.target_sha }}"
+          UPSTREAM_SHA="${{ steps.inspect.outputs.upstream_sha }}"
+
+          echo "Commits present in upstream but not in target:"
+          echo
+
+          if git rev-list \
+              --count \
+              "${TARGET_SHA}..${UPSTREAM_SHA}" \
+              >/dev/null 2>&1; then
+
+            COMMIT_COUNT="$(
+              git rev-list \
+                --count \
+                "${TARGET_SHA}..${UPSTREAM_SHA}"
+            )"
+
+            echo "Commit count: ${COMMIT_COUNT}"
+            echo
+
+            git log \
+              --oneline \
+              --decorate \
+              "${TARGET_SHA}..${UPSTREAM_SHA}"
+
+          else
+
+            echo "Unable to calculate incoming commits."
+            echo "This may indicate unrelated histories."
+
+          fi
+
+      # ============================================================
+      # 7. Update sync branch
+      #
+      # ============================================================
+      #
+      # 重要：
+      #
+      # 这里故意不执行：
+      #
+      #   git merge
+      #   git commit
+      #
+      # sync/upstream-master 会直接指向：
+      #
+      #   upstream/master
+      #
+      # 因此 GitHub Actions 不会创建任何 commit。
+      #
+      # 上游 commit 的：
+      #
+      #   author
+      #   committer
+      #   timestamp
+      #   message
+      #   GPG/SSH signature
+      #
+      # 都不会被重新生成或修改。
+      #
+      # 使用 --force 是有意的，因为 sync branch 本质上是一个
+      # 自动维护的指针，不应该依赖它之前指向什么 commit。
+      # ============================================================
+      - name: Update sync branch
+        if: steps.inspect.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Updating sync branch"
+          echo "========================================"
+
+          UPSTREAM_REF="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          SYNC_REF="refs/heads/${SYNC_BRANCH}"
+
+          UPSTREAM_SHA="${{ steps.inspect.outputs.upstream_sha }}"
+
+          echo "Source:"
+          echo "  ${UPSTREAM_REF}"
+          echo "  ${UPSTREAM_SHA}"
+
+          echo
+          echo "Destination:"
+          echo "  ${SYNC_REF}"
+
+          echo
+          echo "Updating ${SYNC_BRANCH}..."
+
+          git push \
+            origin \
+            "${UPSTREAM_REF}:${SYNC_REF}" \
+            --force
+
+          echo
+          echo "Sync branch updated successfully."
+
+          echo
+          echo "Verifying remote sync branch..."
+
+          git fetch origin "${SYNC_BRANCH}"
+
+          SYNC_SHA="$(
+            git rev-parse "origin/${SYNC_BRANCH}"
+          )"
+
+          echo "Remote sync branch SHA:"
+          echo "  ${SYNC_SHA}"
+
+          if [ "${SYNC_SHA}" != "${UPSTREAM_SHA}" ]; then
+            echo
+            echo "ERROR: Sync branch SHA does not match upstream SHA."
+            echo
+            echo "Expected:"
+            echo "  ${UPSTREAM_SHA}"
+            echo
+            echo "Actual:"
+            echo "  ${SYNC_SHA}"
+
+            exit 1
+          fi
+
+          echo
+          echo "Verification successful."
+          echo "sync/${SYNC_BRANCH} == upstream/${UPSTREAM_BRANCH}"
+
+      # ============================================================
+      # 8. Check existing Pull Request
+      # ============================================================
+      - name: Find existing Pull Request
+        if: steps.inspect.outputs.required == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Checking existing Pull Request"
+          echo "========================================"
+
+          echo "Base branch : ${TARGET_BRANCH}"
+          echo "Head branch : ${SYNC_BRANCH}"
+
+          PR_NUMBER="$(
+            gh pr list \
+              --base "${TARGET_BRANCH}" \
+              --head "${SYNC_BRANCH}" \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+
+          if [ -n "${PR_NUMBER}" ]; then
+            echo
+            echo "Existing Pull Request found:"
+            echo "  #${PR_NUMBER}"
+
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
+          else
+            echo
+            echo "No existing Pull Request found."
+
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # ============================================================
+      # 9. Create Pull Request
+      # ============================================================
+      - name: Create Pull Request
+        if: |
+          steps.inspect.outputs.required == 'true' &&
+          steps.pr.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Creating Pull Request"
+          echo "========================================"
+
+          UPSTREAM_SHA="${{ steps.inspect.outputs.upstream_sha }}"
+          UPSTREAM_SHORT_SHA="${{ steps.inspect.outputs.upstream_short_sha }}"
+
+          TITLE="chore: sync upstream ${UPSTREAM_BRANCH}"
+
+          BODY="$(cat <<EOF
+          ## Upstream synchronization
+
+          This PR was automatically created to synchronize the downstream repository with the upstream repository.
+
+          ### Upstream
+
+          - Repository: \`${UPSTREAM_REPOSITORY}\`
+          - Branch: \`${UPSTREAM_BRANCH}\`
+          - Commit: \`${UPSTREAM_SHA}\`
+
+          ### Target
+
+          - Branch: \`${TARGET_BRANCH}\`
+
+          ### Sync branch
+
+          - Branch: \`${SYNC_BRANCH}\`
+
+          ### Important
+
+          The sync branch points directly to the upstream commit.
+
+          No merge commit or generated commit is created by this workflow.
+
+          Please review the changes before merging this PR.
+          EOF
+          )"
+
+          echo "PR title:"
+          echo "  ${TITLE}"
+
+          echo
+          echo "Creating PR..."
+
+          PR_URL="$(
+            gh pr create \
+              --base "${TARGET_BRANCH}" \
+              --head "${SYNC_BRANCH}" \
+              --title "${TITLE}" \
+              --body "${BODY}"
+          )"
+
+          echo
+          echo "Pull Request created:"
+          echo "  ${PR_URL}"
+
+      # ============================================================
+      # 10. Update existing Pull Request
+      # ============================================================
+      - name: Update Pull Request
+        if: |
+          steps.inspect.outputs.required == 'true' &&
+          steps.pr.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Updating Pull Request"
+          echo "========================================"
+
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          UPSTREAM_SHA="${{ steps.inspect.outputs.upstream_sha }}"
+
+          TITLE="chore: sync upstream ${UPSTREAM_BRANCH}"
+
+          BODY="$(cat <<EOF
+          ## Upstream synchronization
+
+          This PR was automatically updated to the latest upstream commit.
+
+          ### Upstream
+
+          - Repository: \`${UPSTREAM_REPOSITORY}\`
+          - Branch: \`${UPSTREAM_BRANCH}\`
+          - Commit: \`${UPSTREAM_SHA}\`
+
+          ### Target
+
+          - Branch: \`${TARGET_BRANCH}\`
+
+          ### Sync branch
+
+          - Branch: \`${SYNC_BRANCH}\`
+
+          ### Important
+
+          The sync branch points directly to the upstream commit.
+
+          No merge commit or generated commit is created by this workflow.
+
+          Please review the changes before merging this PR.
+          EOF
+          )"
+
+          echo "Pull Request:"
+          echo "  #${PR_NUMBER}"
+
+          echo
+          echo "Updating title and body..."
+
+          gh pr edit "${PR_NUMBER}" \
+            --title "${TITLE}" \
+            --body "${BODY}"
+
+          echo
+          echo "Pull Request updated successfully."
+
+      # ============================================================
+      # 11. No synchronization required
+      # ============================================================
+      - name: No synchronization required
+        if: steps.inspect.outputs.required == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "No synchronization required"
+          echo "========================================"
+
+          echo "Upstream repository:"
+          echo "  ${UPSTREAM_REPOSITORY}"
+
+          echo "Upstream branch:"
+          echo "  ${UPSTREAM_BRANCH}"
+
+          echo "Target branch:"
+          echo "  ${TARGET_BRANCH}"
+
+          echo
+          echo "Upstream commit:"
+          echo "  ${{ steps.inspect.outputs.upstream_sha }}"
+
+          echo
+          echo "Target commit:"
+          echo "  ${{ steps.inspect.outputs.target_sha }}"
+
+          echo
+          echo "The upstream history is already contained in the target branch."
+          echo "Nothing to do."
+
+      # ============================================================
+      # 12. GitHub Actions Summary
+      # ============================================================
+      - name: Generate workflow summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Generating workflow summary"
+          echo "========================================"
+
+          {
+            echo "# Upstream Sync"
+            echo
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Upstream repository | \`${UPSTREAM_REPOSITORY}\` |"
+            echo "| Upstream branch | \`${UPSTREAM_BRANCH}\` |"
+            echo "| Target branch | \`${TARGET_BRANCH}\` |"
+            echo "| Sync branch | \`${SYNC_BRANCH}\` |"
+            echo "| Upstream SHA | \`${{ steps.inspect.outputs.upstream_sha }}\` |"
+            echo "| Target SHA | \`${{ steps.inspect.outputs.target_sha }}\` |"
+            echo "| Sync required | \`${{ steps.inspect.outputs.required }}\` |"
+            echo
+            echo "## Design"
+            echo
+            echo "- The sync branch points directly to the upstream branch."
+            echo "- The workflow does not create Git commits."
+            echo "- The workflow does not perform a Git merge."
+            echo "- Upstream commit history is preserved."
+            echo "- A Pull Request is created or updated for manual review."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo
+          echo "Workflow summary generated successfully."
